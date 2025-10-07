@@ -45,8 +45,7 @@ function compute_peaks(sol, t_events, v)
 	[maximum(u[findall(t -> s <= t <= e, sol.t)]) for (s, e) in t_events]
 end
 
-
-tspan = (0, 250_000)
+tspan = (0, 1_500)
 event_delay = 100.0
 event_duration = 10.0
 
@@ -236,12 +235,12 @@ end
 hybrid_peaks = Matrix{Any}(undef, size(αδ_matrix)...)
 for (i, (α, δ)) in collect(enumerate(αδ_matrix))
 	sol = solve_problem_learning(hybrid_prob, hybrid_ssprob, α, δ)
-	peaks = compute_peaks(sol, hybrid_ev, hybird.G)
+	peaks = compute_peaks(sol, hybrid_ev, hybrid.G)
 	hybrid_peaks[i] = clamp.(peaks, 0, maximum(peaks))
 end
 
-hybrid_fc_hab  = (p -> log2(p[end]/maximum(p))).(hybrid_peaks)
-hybrid_fc_sens = (p -> log2(maximum(p)/p[1])).(hybrid_peaks)
+hybrid_fc_habituation  = (p -> log2(p[end]/maximum(p))).(hybrid_peaks)
+hybrid_fc_sensitization = (p -> log2(maximum(p)/p[1])).(hybrid_peaks)
 
 hybrid_parameters = begin
 	collect(zip(string.(parameters(hybrid)), hybrid_prob.p[1]))
@@ -259,6 +258,8 @@ jldsave("hybrid_heatmap.jld2";
 	equations = string.(equations(hybrid)),
 	parameters = hybrid_parameters,
 )
+
+# Massed--Spaced
 
 @mtkmodel Massed begin
 	@parameters begin
@@ -286,7 +287,7 @@ end
 
 @mtkbuild massed = Massed()
 
-function solve_model(sys, u0, tspan, ps, ev_repeats, ev_delay, ev_duration)
+function solve_massed(sys, tspan, ev_repeats, ev_delay, ev_duration)
 	duration_single = ev_duration/ev_repeats
 	t_start_events = if ev_delay == 0.0
 		tspan[1] + 1
@@ -317,11 +318,11 @@ function solve_model(sys, u0, tspan, ps, ev_repeats, ev_delay, ev_duration)
 	)
 	
 	# Solve steady state problem
-	ssprob = SteadyStateProblem(sys, u0, ps)
+	ssprob = SteadyStateProblem(sys, [])
 	sssol = solve(ssprob, DynamicSS(Rodas5P()))
 	
 	# Solve ODE problem
-	ode = ODEProblem(sys, sssol.u, tspan, ps; callback = cbs)
+	ode = ODEProblem(sys, sssol.u, tspan; callback = cbs)
 	sol = solve(ode, AutoTsit5(Rosenbrock23());
 		maxiters = 1e7,
 	)
@@ -330,7 +331,6 @@ function solve_model(sys, u0, tspan, ps, ev_repeats, ev_delay, ev_duration)
 	(sol, events)
 end
 
-u0 = [massed.G => 0.0, massed.X => 0.0, massed.x => 0.0, massed.A => 0.0]
 tspan = (0.0, 1e9)
 
 ev_duration = 100.0
@@ -341,12 +341,12 @@ delay_repeat_matrix = collect(Iterators.product(ev_delays, ev_repeats))
 
 massed_spaced_peaks = Matrix{Any}(undef, size(delay_repeat_matrix)...)
 for (i, (d, r)) in collect(enumerate(delay_repeat_matrix))
-	sol, _ = solve_model_massed(massed, u0, tspan, ps, r, d, ev_duration)
+	sol, _ = solve_massed(massed, tspan, r, d, ev_duration)
 	massed_spaced_peaks[i] = maximum(sol(sol.t; idxs = massed.G))
 end
 
 massed_peak = begin
-	sol, events = solve_model(massed, u0, tspan, ps, 1, 0.0, ev_duration)
+	sol, events = solve_massed(massed, tspan, 1, 0.0, ev_duration)
 	maximum(sol(sol.t; idxs = massed.G))
 end
 
@@ -356,8 +356,7 @@ jldsave("massed_heatmap.jld2";
 	peaks = massed_spaced_peaks,
 	massed_peak,
 	tspan,
-	event_delay,
-	event_duration,
+	ev_duration,
 	equations = string.(equations(massed)),
 	parameters = massed_parameters,
 )
