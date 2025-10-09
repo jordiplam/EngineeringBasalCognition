@@ -94,7 +94,7 @@ habituation_sol = begin
 	solve_problem_learning(habituation_prob, habituation_ssprob, α, δ)
 end
 
-habituation_peaks = Matrix{Any}(undef, size(αδ_matrix)...)
+habituation_peaks = Matrix{Vector{Float64}}(undef, size(αδ_matrix)...)
 for (i, (α, δ)) in collect(enumerate(αδ_matrix))
 	sol = solve_problem_learning(habituation_prob, habituation_ssprob, α, δ)
 	peaks = compute_peaks(sol, habituation_ev, habituation.G)
@@ -104,10 +104,11 @@ end
 habituation_fc = (p -> log2(p[end]/p[1])).(habituation_peaks)
 
 habituation_parameters = begin
-	collect(zip(string.(parameters(habituation)), habituation_prob.p[1]))
+	sym_params = Symbol.("parameters/".*string.(parameters(habituation)))
+	collect(zip(sym_params, habituation_prob.p[1]))
 end
 
-jldsave("habituation.jld2";
+jldsave("habituation_heatmap.jld2";
 	α_list,
 	δ_list,
 	peaks = habituation_peaks,
@@ -116,7 +117,7 @@ jldsave("habituation.jld2";
 	event_delay,
 	event_duration,
 	equations = string.(equations(habituation)),
-	parameters = habituation_parameters,
+	habituation_parameters...,
 )
 
 # Sensitization
@@ -163,7 +164,7 @@ sensitization_sol = begin
 	solve_problem_learning(sensitization_prob, sensitization_ssprob, α, δ)
 end
 
-sensitization_peaks = Matrix{Any}(undef, size(αδ_matrix)...)
+sensitization_peaks = Matrix{Vector{Float64}}(undef, size(αδ_matrix)...)
 for (i, (α, δ)) in collect(enumerate(αδ_matrix))
 	sol = solve_problem_learning(sensitization_prob, sensitization_ssprob, α, δ)
 	peaks = compute_peaks(sol, sensitization_ev, sensitization.G)
@@ -173,7 +174,8 @@ end
 sensitization_fc = (p -> log2(p[end]/p[1])).(sensitization_peaks)
 
 sensitization_parameters = begin
-	collect(zip(string.(parameters(sensitization)), sensitization_prob.p[1]))
+	sym_params = Symbol.("parameters/".*string.(parameters(sensitization)))
+	collect(zip(sym_params, sensitization_prob.p[1]))
 end
 
 jldsave("sensitization_heatmap.jld2";
@@ -185,7 +187,7 @@ jldsave("sensitization_heatmap.jld2";
 	event_delay,
 	event_duration,
 	equations = string.(equations(sensitization)),
-	parameters = sensitization_parameters,
+	sensitization_parameters...,
 )
 
 # Combining Sensitization and Habituation
@@ -232,7 +234,7 @@ hybrid_sol = begin
 	solve_problem_learning(hybrid_prob, hybrid_ssprob, α, δ)
 end
 
-hybrid_peaks = Matrix{Any}(undef, size(αδ_matrix)...)
+hybrid_peaks = Matrix{Vector{Float64}}(undef, size(αδ_matrix)...)
 for (i, (α, δ)) in collect(enumerate(αδ_matrix))
 	sol = solve_problem_learning(hybrid_prob, hybrid_ssprob, α, δ)
 	peaks = compute_peaks(sol, hybrid_ev, hybrid.G)
@@ -243,7 +245,8 @@ hybrid_fc_habituation  = (p -> log2(p[end]/maximum(p))).(hybrid_peaks)
 hybrid_fc_sensitization = (p -> log2(maximum(p)/p[1])).(hybrid_peaks)
 
 hybrid_parameters = begin
-	collect(zip(string.(parameters(hybrid)), hybrid_prob.p[1]))
+	sym_params = Symbol.("parameters/".*string.(parameters(hybrid)))
+	collect(zip(sym_params, hybrid_prob.p[1]))
 end
 
 jldsave("hybrid_heatmap.jld2";
@@ -256,7 +259,7 @@ jldsave("hybrid_heatmap.jld2";
 	event_delay,
 	event_duration,
 	equations = string.(equations(hybrid)),
-	parameters = hybrid_parameters,
+	hybrid_parameters...,
 )
 
 # Massed--Spaced
@@ -339,7 +342,7 @@ ev_delays = 10 .^ (range(log10(1e-2), log10(1e5), 500))
 
 delay_repeat_matrix = collect(Iterators.product(ev_delays, ev_repeats))
 
-massed_spaced_peaks = Matrix{Any}(undef, size(delay_repeat_matrix)...)
+massed_spaced_peaks = Matrix{Float64}(undef, size(delay_repeat_matrix)...)
 for (i, (d, r)) in collect(enumerate(delay_repeat_matrix))
 	sol, _ = solve_massed(massed, tspan, r, d, ev_duration)
 	massed_spaced_peaks[i] = maximum(sol(sol.t; idxs = massed.G))
@@ -350,6 +353,12 @@ massed_peak = begin
 	maximum(sol(sol.t; idxs = massed.G))
 end
 
+massed_parameters = begin
+	sym_params = Symbol.("parameters/".*string.(parameters(massed)))
+	p = ODEProblem(massed, [], tspan).p
+	collect(zip(sym_params, p[1]))
+end
+
 jldsave("massed_heatmap.jld2";
 	ev_repeats,
 	ev_delays,
@@ -358,5 +367,5 @@ jldsave("massed_heatmap.jld2";
 	tspan,
 	ev_duration,
 	equations = string.(equations(massed)),
-	parameters = massed_parameters,
+	massed_parameters...,
 )
