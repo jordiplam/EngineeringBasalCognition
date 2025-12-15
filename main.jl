@@ -33,10 +33,10 @@ function generate_callbacks(model, tspan, event_delay, event_duration)
 	return (cbs, events)
 end
 
-function solve_problem_learning(def_prob, def_ssprob, α, δ)
-	ssprob = remake(def_ssprob; p = [:α => α, :δ => δ])
+function solve_problem_learning(def_prob, def_ssprob, α, γ)
+	ssprob = remake(def_ssprob; p = [:α => α, :γ => γ])
 	sssol = solve(ssprob, DynamicSS(Rodas5P()))
-	prob = remake(def_prob; u0 = sssol.u, p = [:α => α, :δ => δ])
+	prob = remake(def_prob; u0 = sssol.u, p = [:α => α, :γ => γ])
 	sol = solve(prob, AutoTsit5(Rosenbrock23()); maxiters = 1e7)
 end
 
@@ -50,9 +50,9 @@ event_delay = 100.0
 event_duration = 10.0
 
 α_list = 10 .^ (range(log10(1e-3), log10(1e1), 400))
-δ_list = 10 .^ (range(log10(1e-5), log10(1e0), 400))
+γ_list = 10 .^ (range(log10(1e-5), log10(1e0), 400))
 
-αδ_matrix = collect(Iterators.product(α_list, δ_list))
+αγ_matrix = collect(Iterators.product(α_list, γ_list))
 
 # Habituation
 
@@ -60,8 +60,8 @@ event_duration = 10.0
 	@parameters begin
 		α = 1e-1
 		β = 2.0
-		γ = 1.0
-		δ = 1e-3
+		μ = 1.0
+		γ = 1e-3
 		λ = 1.0
 	end
 	@variables begin
@@ -72,8 +72,8 @@ event_duration = 10.0
 	end
 	@equations begin
 		D(x) ~ 0
-		D(X) ~ γ - λ*X
-		D(I) ~ α*θp(X*x, 1) - δ*I
+		D(X) ~ μ - λ*X
+		D(I) ~ α*θp(X*x, 1) - γ*I
 		D(G) ~ β*θp(X*x, 1)*θm(I, 1) - λ*G
 	end
 end
@@ -90,13 +90,13 @@ habituation_prob = ODEProblem(habituation, [], tspan;
 
 habituation_sol = begin
 	α = 1e-1
-	δ = 1e-3
-	solve_problem_learning(habituation_prob, habituation_ssprob, α, δ)
+	γ = 1e-3
+	solve_problem_learning(habituation_prob, habituation_ssprob, α, γ)
 end
 
-habituation_peaks = Matrix{Vector{Float64}}(undef, size(αδ_matrix)...)
-for (i, (α, δ)) in collect(enumerate(αδ_matrix))
-	sol = solve_problem_learning(habituation_prob, habituation_ssprob, α, δ)
+habituation_peaks = Matrix{Vector{Float64}}(undef, size(αγ_matrix)...)
+for (i, (α, γ)) in collect(enumerate(αγ_matrix))
+	sol = solve_problem_learning(habituation_prob, habituation_ssprob, α, γ)
 	peaks = compute_peaks(sol, habituation_ev, habituation.G)
 	habituation_peaks[i] = clamp.(peaks, 0, maximum(peaks))
 end
@@ -110,7 +110,7 @@ end
 
 jldsave("habituation_heatmap.jld2";
 	α_list,
-	δ_list,
+	γ_list,
 	peaks = habituation_peaks,
 	fc = habituation_fc,
 	tspan,
@@ -126,8 +126,8 @@ jldsave("habituation_heatmap.jld2";
 	@parameters begin
 		α = 1e-1
 		β = 2.0
-		γ = 1.0
-		δ = 1e-3
+		μ = 1.0
+		γ = 1e-3
 		λ = 1.0
 		ρ = 1.5
 	end
@@ -140,8 +140,8 @@ jldsave("habituation_heatmap.jld2";
 	end
 	@equations begin
 		D(x) ~ 0
-		D(X) ~ γ*θm(R, 1) - λ*X
-		D(I) ~ α*θp(X*x, 1) - δ*I
+		D(X) ~ μ*θm(R, 1) - λ*X
+		D(I) ~ α*θp(X*x, 1) - γ*I
 		D(R) ~ ρ*θm(I, 1) - λ*R
 		D(G) ~ β*θp(X*x, 1) - λ*G
 	end
@@ -160,13 +160,13 @@ sensitization_prob = ODEProblem(sensitization, [], tspan;
 
 sensitization_sol = begin
 	α = 1e-1
-	δ = 1e-3
-	solve_problem_learning(sensitization_prob, sensitization_ssprob, α, δ)
+	γ = 1e-3
+	solve_problem_learning(sensitization_prob, sensitization_ssprob, α, γ)
 end
 
-sensitization_peaks = Matrix{Vector{Float64}}(undef, size(αδ_matrix)...)
-for (i, (α, δ)) in collect(enumerate(αδ_matrix))
-	sol = solve_problem_learning(sensitization_prob, sensitization_ssprob, α, δ)
+sensitization_peaks = Matrix{Vector{Float64}}(undef, size(αγ_matrix)...)
+for (i, (α, γ)) in collect(enumerate(αγ_matrix))
+	sol = solve_problem_learning(sensitization_prob, sensitization_ssprob, α, γ)
 	peaks = compute_peaks(sol, sensitization_ev, sensitization.G)
 	sensitization_peaks[i] = clamp.(peaks, 0, maximum(peaks))
 end
@@ -180,7 +180,7 @@ end
 
 jldsave("sensitization_heatmap.jld2";
 	α_list,
-	δ_list,
+	γ_list,
 	peaks = sensitization_peaks,
 	fc = sensitization_fc,
 	tspan,
@@ -196,8 +196,8 @@ jldsave("sensitization_heatmap.jld2";
 	@parameters begin
 		α = 1e-1
 		β = 4.0
-		γ = 1.0
-		δ = 1e-3
+		μ = 1.0
+		γ = 1e-3
 		λ = 1.0
 		ρ = 1.5
 	end
@@ -210,8 +210,8 @@ jldsave("sensitization_heatmap.jld2";
 	end
 	@equations begin
 		D(x) ~ 0
-		D(X) ~ γ*θm(R, 1) - λ*X
-		D(I) ~ α*θp(X*x, 1) - δ*I
+		D(X) ~ μ*θm(R, 1) - λ*X
+		D(I) ~ α*θp(X*x, 1) - γ*I
 		D(R) ~ ρ*θm(I, 1) - λ*R
 		D(G) ~ β*θp(X*x, 1)*θm(I, 2) - λ*G
 	end
@@ -230,13 +230,13 @@ hybrid_prob = ODEProblem(hybrid, [], 2 .* tspan;
 
 hybrid_sol = begin
 	α = 1e-1
-	δ = 1e-3
-	solve_problem_learning(hybrid_prob, hybrid_ssprob, α, δ)
+	γ = 1e-3
+	solve_problem_learning(hybrid_prob, hybrid_ssprob, α, γ)
 end
 
-hybrid_peaks = Matrix{Vector{Float64}}(undef, size(αδ_matrix)...)
-for (i, (α, δ)) in collect(enumerate(αδ_matrix))
-	sol = solve_problem_learning(hybrid_prob, hybrid_ssprob, α, δ)
+hybrid_peaks = Matrix{Vector{Float64}}(undef, size(αγ_matrix)...)
+for (i, (α, γ)) in collect(enumerate(αγ_matrix))
+	sol = solve_problem_learning(hybrid_prob, hybrid_ssprob, α, γ)
 	peaks = compute_peaks(sol, hybrid_ev, hybrid.G)
 	hybrid_peaks[i] = clamp.(peaks, 0, maximum(peaks))
 end
@@ -251,7 +251,7 @@ end
 
 jldsave("hybrid_heatmap.jld2";
 	α_list,
-	δ_list,
+	γ_list,
 	peaks = hybrid_peaks,
 	fc_hab = hybrid_fc_habituation,
 	fc_sens = hybrid_fc_sensitization,
@@ -268,9 +268,9 @@ jldsave("hybrid_heatmap.jld2";
 	@parameters begin
 		α = 1e-1
 		β = 1e-1
-		δ = 1e-3
+		γ = 1e-3
 		λ = 1e+0
-		γ = 1e+1
+		μ = 1e+1
 	end
 	
 	@variables begin
@@ -282,9 +282,9 @@ jldsave("hybrid_heatmap.jld2";
 	
 	@equations begin
 		D(x) ~ 0
-		D(X) ~ γ - λ*X
-		D(A) ~ α*θp(X*x, 1.0) - δ*A
-		D(G) ~ β*θp(A, 1.0) - δ*G
+		D(X) ~ μ - λ*X
+		D(A) ~ α*θp(X*x, 1.0) - γ*A
+		D(G) ~ β*θp(A, 1.0) - γ*G
 	end
 end
 
