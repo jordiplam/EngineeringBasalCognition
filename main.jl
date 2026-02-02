@@ -10,34 +10,60 @@ using ModelingToolkit: t_nounits as t, D_nounits as D
 θp(L, K) = L^2/(K + L^2)
 θm(L, K) = 1/(1 + (L/K)^2)
 
-function generate_callbacks(model, tspan, event_delay, event_duration)
+function generate_callbacks_learning(sys, tspan, delay, duration)
 	# Create event time points
-	t_start_events = (tspan[1]:event_delay:tspan[2])[2:end-1]
-	t_end_events = t_start_events .+ event_duration
-	x_var = ModelingToolkit.getvar(model, :x)
-	x_pos = findfirst(isequal(x_var), unknowns(model))
+	t_start_events = (tspan[1]:delay:tspan[2])[2:end-1]
+	t_end_events = t_start_events .+ duration
+
+	# Find the index of x in the state variables
+	x_pos = findfirst(isequal(sys.x), unknowns(sys))
+
+	# Find the index of G in the state variables
+	G_pos = findfirst(isequal(sys.G), unknowns(sys))
+
+	# Find extrema.
+	dG_zero = (u, t, integrator) -> let
+		du = similar(u)
+		integrator.f(du, u, integrator.p, t)
+		du[G_pos]
+	end
 	
 	# Create callbacks for events
 	cbs = CallbackSet(
 		PositiveDomain(save = false),
 		PresetTimeCallback(
 			t_start_events,
-			(integrator) -> integrator.u[x_pos] = 1
+			(integrator) -> integrator.u[x_pos] = 1,
 		),
 		PresetTimeCallback(
 			t_end_events,
-			(integrator) -> integrator.u[x_pos] = 0
-		)
+			(integrator) -> integrator.u[x_pos] = 0,
+		),
+		# Find maxima.
+		ContinuousCallback(dG_zero, nothing, i -> nothing),
 	)
 	events = collect(zip(t_start_events, t_end_events))
+
 	return (cbs, events)
 end
 
 function solve_problem_learning(def_prob, def_ssprob, α, γ)
+	# Solve system for steady state with no input.
 	ssprob = remake(def_ssprob; p = [:α => α, :γ => γ])
-	sssol = solve(ssprob, DynamicSS(Rodas5P()))
+	sssol = solve(ssprob, DynamicSS(Rodas5P());
+		abstol = 1e-8,
+		reltol = 1e-8,
+	)
+
+	# Solve system from steady state with callbacks.
 	prob = remake(def_prob; u0 = sssol.u, p = [:α => α, :γ => γ])
-	sol = solve(prob, AutoTsit5(Rosenbrock23()); maxiters = 1e7)
+	sol = solve(prob, AutoTsit5(Rosenbrock23());
+		abstol = 1e-6,
+		reltol = 1e-6,
+		maxiters = 1e7,
+	)
+
+	return sol
 end
 
 function compute_peaks(sol, t_events, v)
@@ -45,92 +71,120 @@ function compute_peaks(sol, t_events, v)
 	[maximum(u[findall(t -> s <= t <= e, sol.t)]) for (s, e) in t_events]
 end
 
-tspan = (0, 1_500)
-event_delay = 100.0
-event_duration = 10.0
+function solve_system_learning(sys, tspan; delay, duration, αs, γs)
+	cbs, evs = generate_callbacks_learning(sys, tspan, delay, duration)
 
-α_list = 10 .^ (range(log10(1e-3), log10(1e1), 400))
-γ_list = 10 .^ (range(log10(1e-5), log10(1e0), 400))
+	ssprob = SteadyStateProblem(sys, [])
 
-αγ_matrix = collect(Iterators.product(α_list, γ_list))
+	prob = ODEProblem(sys, [], tspan;
+		callback = cbs,
+	)
+
+	sol = let
+		α = 1.0
+		γ = 1e-2
+		solve_problem_learning(prob, ssprob, 1.0, 1e-2)
+	end
+
+	t_range = collect(range(extrema(sol.t)..., 10_000))
+	uks = map(unknowns(sys)) do uk
+		s = Symbol("sample/"*string(uk))
+		u = sol(t_range; idxs = uk).u
+		(s, u)
+	end
+
+	sample = vcat((Symbol("sample/t"), t_range), uks...)
+
+	ps = let
+		p = parameters(sys)
+		sym_p = Symbol.("parameters/".*string.(p))
+		collect(zip(sym_p, prob.p[1]))
+	end
+
+	peaks = map(Iterators.product(αs, γs)) do (α, γ)
+		sol = solve_problem_learning(prob, ssprob, α, γ)
+		compute_peaks(sol, evs, sys.G)
+	end
+
+	return Dict(
+		:α_list => αs,
+		:γ_list => γs,
+		:peaks => peaks,
+		:tspan => tspan,
+		:event_delay => delay,
+		:event_duration => duration,
+		:equations => string.(equations(sys)),
+		:parameters => ps,
+		:sample => sample,
+	)
+end
+
+tspan = (0, 150)
+shared_learning_args = Dict(
+	:delay => 10.0,
+	:duration => 1.0,
+	:αs => 10 .^ (range(log10(1e-2), log10(1e2), 1000)),
+	:γs => 10 .^ (range(log10(5e-3), log10(1/2), 1000)),
+)
 
 # Habituation
 
-@mtkmodel Habituation begin
+function habituation_system()
 	@parameters begin
-		α = 1e-1
-		β = 2.0
+		α = 1.0
+		β = 5.0
 		μ = 1.0
-		γ = 1e-3
+		γ = 1e-2
 		λ = 1.0
 	end
+
 	@variables begin
 		x(t) = 0.0
 		X(t) = 0.0
 		I(t) = 0.0
 		G(t) = 0.0
 	end
-	@equations begin
-		D(x) ~ 0
-		D(X) ~ μ - λ*X
-		D(I) ~ α*θp(X*x, 1) - γ*I
-		D(G) ~ β*θp(X*x, 1)*θm(I, 1) - λ*G
-	end
+
+	eqs = [
+		D(x) ~ 0,
+		D(X) ~ μ - λ*X,
+		D(I) ~ α*θp(X*x, 1) - γ*I,
+		D(G) ~ β*θp(X*x, 1)*θm(I, 1) - λ*G,
+	]
+
+	@mtkcompile sys = System(eqs, t)
 end
 
-@mtkbuild habituation = Habituation()
-
-habituation_cbs, habituation_ev = begin
-	generate_callbacks(habituation, tspan, event_delay, event_duration)
-end
-habituation_ssprob = SteadyStateProblem(habituation, [])
-habituation_prob = ODEProblem(habituation, [], tspan;
-	callback = habituation_cbs,
-)
-
-habituation_sol = begin
-	α = 1e-1
-	γ = 1e-3
-	solve_problem_learning(habituation_prob, habituation_ssprob, α, γ)
-end
-
-habituation_peaks = Matrix{Vector{Float64}}(undef, size(αγ_matrix)...)
-for (i, (α, γ)) in collect(enumerate(αγ_matrix))
-	sol = solve_problem_learning(habituation_prob, habituation_ssprob, α, γ)
-	peaks = compute_peaks(sol, habituation_ev, habituation.G)
-	habituation_peaks[i] = clamp.(peaks, 0, maximum(peaks))
-end
-
-habituation_fc = (p -> log2(p[end]/p[1])).(habituation_peaks)
-
-habituation_parameters = begin
-	sym_params = Symbol.("parameters/".*string.(parameters(habituation)))
-	collect(zip(sym_params, habituation_prob.p[1]))
+habituation_data = let
+	sys = habituation_system()
+	solve_system_learning(sys, tspan; shared_learning_args...)
 end
 
 jldsave("habituation_heatmap.jld2";
-	α_list,
-	γ_list,
-	peaks = habituation_peaks,
-	fc = habituation_fc,
-	tspan,
-	event_delay,
-	event_duration,
-	equations = string.(equations(habituation)),
-	habituation_parameters...,
+	equations = habituation_data[:equations],
+	event_delay = habituation_data[:event_delay],
+	event_duration = habituation_data[:event_duration],
+	fc = (p -> log2(p[end]/p[1])).(habituation_data[:peaks]),
+	peaks = habituation_data[:peaks],
+	tspan = habituation_data[:tspan],
+	α_list = habituation_data[:α_list],
+	γ_list = habituation_data[:γ_list],
+	habituation_data[:parameters]...,
+	habituation_data[:sample]...,
 )
 
 # Sensitization
 
-@mtkmodel Sensitization begin
+function sensitization_system()
 	@parameters begin
-		α = 1e-1
-		β = 2.0
+		α = 1.0
+		β = 5.0
 		μ = 1.0
-		γ = 1e-3
+		γ = 1e-2
 		λ = 1.0
 		ρ = 1.5
 	end
+
 	@variables begin
 		x(t) = 0.0
 		X(t) = 0.0
@@ -138,69 +192,48 @@ jldsave("habituation_heatmap.jld2";
 		R(t) = 0.0
 		G(t) = 0.0
 	end
-	@equations begin
-		D(x) ~ 0
-		D(X) ~ μ*θm(R, 1) - λ*X
-		D(I) ~ α*θp(X*x, 1) - γ*I
-		D(R) ~ ρ*θm(I, 1) - λ*R
-		D(G) ~ β*θp(X*x, 1) - λ*G
-	end
+
+	eqs = [
+		D(x) ~ 0,
+		D(X) ~ μ*θm(R, 1) - λ*X,
+		D(I) ~ α*θp(X*x, 1) - γ*I,
+		D(R) ~ ρ*θm(I, 1) - λ*R,
+		D(G) ~ β*θp(X*x, 1) - λ*G,
+	]
+
+	@mtkcompile sys = System(eqs, t)
 end
 
-@mtkbuild sensitization = Sensitization()
-
-sensitization_cbs, sensitization_ev = begin
-	generate_callbacks(sensitization, tspan, event_delay, event_duration)
-end
-
-sensitization_ssprob = SteadyStateProblem(sensitization, [])
-sensitization_prob = ODEProblem(sensitization, [], tspan;
-	callback = sensitization_cbs,
-)
-
-sensitization_sol = begin
-	α = 1e-1
-	γ = 1e-3
-	solve_problem_learning(sensitization_prob, sensitization_ssprob, α, γ)
-end
-
-sensitization_peaks = Matrix{Vector{Float64}}(undef, size(αγ_matrix)...)
-for (i, (α, γ)) in collect(enumerate(αγ_matrix))
-	sol = solve_problem_learning(sensitization_prob, sensitization_ssprob, α, γ)
-	peaks = compute_peaks(sol, sensitization_ev, sensitization.G)
-	sensitization_peaks[i] = clamp.(peaks, 0, maximum(peaks))
-end
-
-sensitization_fc = (p -> log2(p[end]/p[1])).(sensitization_peaks)
-
-sensitization_parameters = begin
-	sym_params = Symbol.("parameters/".*string.(parameters(sensitization)))
-	collect(zip(sym_params, sensitization_prob.p[1]))
+sensitization_data = let
+	sys = sensitization_system()
+	solve_system_learning(sys, tspan; shared_learning_args...)
 end
 
 jldsave("sensitization_heatmap.jld2";
-	α_list,
-	γ_list,
-	peaks = sensitization_peaks,
-	fc = sensitization_fc,
-	tspan,
-	event_delay,
-	event_duration,
-	equations = string.(equations(sensitization)),
-	sensitization_parameters...,
+	equations = sensitization_data[:equations],
+	event_delay = sensitization_data[:event_delay],
+	event_duration = sensitization_data[:event_duration],
+	fc = (p -> log2(p[end]/p[1])).(sensitization_data[:peaks]),
+	peaks = sensitization_data[:peaks],
+	tspan = sensitization_data[:tspan],
+	α_list = sensitization_data[:α_list],
+	γ_list = sensitization_data[:γ_list],
+	sensitization_data[:parameters]...,
+	sensitization_data[:sample]...,
 )
 
 # Combining Sensitization and Habituation
 
-@mtkmodel Hybrid begin
+function hybrid_system()
 	@parameters begin
-		α = 1e-1
-		β = 4.0
+		α = 1.0
+		β = 5.0
 		μ = 1.0
-		γ = 1e-3
+		γ = 1e-2
 		λ = 1.0
-		ρ = 1.5
+		ρ = 1.75
 	end
+
 	@variables begin
 		x(t) = 0.0
 		X(t) = 0.0
@@ -208,69 +241,45 @@ jldsave("sensitization_heatmap.jld2";
 		R(t) = 0.0
 		G(t) = 0.0
 	end
-	@equations begin
-		D(x) ~ 0
-		D(X) ~ μ*θm(R, 1) - λ*X
-		D(I) ~ α*θp(X*x, 1) - γ*I
-		D(R) ~ ρ*θm(I, 1) - λ*R
-		D(G) ~ β*θp(X*x, 1)*θm(I, 2) - λ*G
-	end
+
+	eqs = [
+		D(x) ~ 0,
+		D(X) ~ μ*θm(R, 1) - λ*X,
+		D(I) ~ α*θp(X*x, 1) - γ*I,
+		D(R) ~ ρ*θm(I, 1) - λ*R,
+		D(G) ~ β*θp(X*x, 1)*θm(I, 2) - λ*G,
+	]
+
+	@mtkcompile sys = System(eqs, t)
 end
 
-@mtkbuild hybrid = Hybrid()
-
-hybrid_cbs, hybrid_ev = begin
-	generate_callbacks(hybrid, 2 .* tspan, event_delay, event_duration)
-end
-
-hybrid_ssprob = SteadyStateProblem(hybrid, [])
-hybrid_prob = ODEProblem(hybrid, [], 2 .* tspan;
-	callback = hybrid_cbs,
-)
-
-hybrid_sol = begin
-	α = 1e-1
-	γ = 1e-3
-	solve_problem_learning(hybrid_prob, hybrid_ssprob, α, γ)
-end
-
-hybrid_peaks = Matrix{Vector{Float64}}(undef, size(αγ_matrix)...)
-for (i, (α, γ)) in collect(enumerate(αγ_matrix))
-	sol = solve_problem_learning(hybrid_prob, hybrid_ssprob, α, γ)
-	peaks = compute_peaks(sol, hybrid_ev, hybrid.G)
-	hybrid_peaks[i] = clamp.(peaks, 0, maximum(peaks))
-end
-
-hybrid_fc_habituation  = (p -> log2(p[end]/maximum(p))).(hybrid_peaks)
-hybrid_fc_sensitization = (p -> log2(maximum(p)/p[1])).(hybrid_peaks)
-
-hybrid_parameters = begin
-	sym_params = Symbol.("parameters/".*string.(parameters(hybrid)))
-	collect(zip(sym_params, hybrid_prob.p[1]))
+hybrid_data = let
+	sys = hybrid_system()
+	solve_system_learning(sys, 3 .* tspan; shared_learning_args...)
 end
 
 jldsave("hybrid_heatmap.jld2";
-	α_list,
-	γ_list,
-	peaks = hybrid_peaks,
-	fc_hab = hybrid_fc_habituation,
-	fc_sens = hybrid_fc_sensitization,
-	tspan,
-	event_delay,
-	event_duration,
-	equations = string.(equations(hybrid)),
-	hybrid_parameters...,
+	equations = hybrid_data[:equations],
+	event_delay = hybrid_data[:event_delay],
+	event_duration = hybrid_data[:event_duration],
+	fc_habituation = (p -> log2(p[end]/maximum(p))).(hybrid_data[:peaks]),
+	fc_sensitization = (p -> log2(maximum(p)/p[1])).(hybrid_data[:peaks]),
+	peaks = hybrid_data[:peaks],
+	tspan = hybrid_data[:tspan],
+	α_list = hybrid_data[:α_list],
+	γ_list = hybrid_data[:γ_list],
+	hybrid_data[:parameters]...,
+	hybrid_data[:sample]...,
 )
 
 # Massed--Spaced
-
-@mtkmodel Massed begin
+function massed_system()
 	@parameters begin
-		α = 1e-1
-		β = 1e-1
-		γ = 1e-3
-		λ = 1e+0
-		μ = 1e+1
+		α = 1.0
+		β = 1.0
+		γ = 1e-2
+		λ = 1.0
+		μ = 1.0
 	end
 	
 	@variables begin
@@ -280,92 +289,110 @@ jldsave("hybrid_heatmap.jld2";
 		A(t) = 0.0
 	end
 	
-	@equations begin
-		D(x) ~ 0
-		D(X) ~ μ - λ*X
-		D(A) ~ α*θp(X*x, 1.0) - γ*A
-		D(G) ~ β*θp(A, 1.0) - γ*G
-	end
+	eqs = [
+		D(x) ~ 0,
+		D(X) ~ μ - λ*X,
+		D(A) ~ α*θp(X*x, 1.0) - γ*A,
+		D(G) ~ β*θp(A, 1.0) - γ*G,
+	]
+
+	@mtkcompile sys = System(eqs, t)
 end
 
-@mtkbuild massed = Massed()
-
-function solve_massed(sys, tspan, ev_repeats, ev_delay, ev_duration)
-	duration_single = ev_duration/ev_repeats
-	t_start_events = if ev_delay == 0.0
-		tspan[1] + 1
+function solve_massed(sys, tspan, repeats, delay, duration)
+	duration_single = duration/repeats
+	t_start_events = if delay == 0.0
+		first(tspan) + 1
 	else
-		step = ev_delay + duration_single
-		(tspan[1] + 1:step:tspan[2])[1:ev_repeats]
+		step = delay + duration_single
+		(first(tspan) + 1:step:last(tspan))[1:repeats]
 	end
 	t_end_events = if length(t_start_events) == 1
-		t_start_events .+ ev_duration
+		t_start_events .+ duration
 	else
 		t_start_events .+ duration_single
 	end
-	
+
 	# Find the index of x in the state variables
-	find_x_pos = findfirst(isequal(sys.x), unknowns(sys))
+	x_pos = findfirst(isequal(sys.x), unknowns(sys))
+
+	# Find the index of G in the state variables
+	G_pos = findfirst(isequal(sys.G), unknowns(sys))
+
+	# Find extrema.
+	dG_zero = (u, t, integrator) -> begin
+		du = similar(u)
+		integrator.f(du, u, integrator.p, t)
+		du[G_pos]
+	end
 	
 	cbs = CallbackSet(
 		PositiveDomain(save = false),
-		TerminateSteadyState(min_t = last(t_end_events)),
+		TerminateSteadyState(min_t = last(t_end_events) + delay),
 		PresetTimeCallback(
 			t_start_events,
-			(i) -> i.u[find_x_pos] = 1,
+			(integrator) -> integrator.u[x_pos] = 1,
 		),
 		PresetTimeCallback(
 			t_end_events,
-			(i) -> i.u[find_x_pos] = 0,
+			(integrator) -> integrator.u[x_pos] = 0,
 		),
+		# Find maxima.
+		ContinuousCallback(dG_zero, nothing, i -> nothing),
 	)
-	
+
 	# Solve steady state problem
-	ssprob = SteadyStateProblem(sys, [])
-	sssol = solve(ssprob, DynamicSS(Rodas5P()))
-	
+	prob_ss = SteadyStateProblem(sys, [])
+	sol_ss = solve(prob_ss, DynamicSS(Rodas5P());
+		abstol = 1e-8,
+		reltol = 1e-8,
+	)
+
 	# Solve ODE problem
-	ode = ODEProblem(sys, sssol.u, tspan; callback = cbs)
+	u_ss = [v => u for (v, u) in zip(unknowns(sys), sol_ss.u)]
+	ode = ODEProblem(sys, u_ss, tspan; callback = cbs)
 	sol = solve(ode, AutoTsit5(Rosenbrock23());
+		abstol = 1e-6,
+		reltol = 1e-6,
 		maxiters = 1e7,
 	)
-	
-	events = collect(zip(t_start_events, t_end_events))
-	(sol, events)
+
+	(sol, collect(zip(t_start_events, t_end_events)))
 end
 
 tspan = (0.0, 1e9)
 
-ev_duration = 100.0
-ev_repeats = unique(floor.(Int64, 10 .^ (range(log10(1), log10(1e4), 500))))
-ev_delays = 10 .^ (range(log10(1e-2), log10(1e5), 500))
+duration = 10.0
+repeats = 1:1_000
+delays = 10 .^ (range(log10(1e-2), log10(1e4), 1000))
 
-delay_repeat_matrix = collect(Iterators.product(ev_delays, ev_repeats))
-
-massed_spaced_peaks = Matrix{Float64}(undef, size(delay_repeat_matrix)...)
-for (i, (d, r)) in collect(enumerate(delay_repeat_matrix))
-	sol, _ = solve_massed(massed, tspan, r, d, ev_duration)
-	massed_spaced_peaks[i] = maximum(sol(sol.t; idxs = massed.G))
+massed_spaced_peaks = map(Iterators.product(repeats, delays)) do (r, d)
+	sys = massed_system()
+	sol, _ = solve_massed(sys, tspan, r, d, duration)
+	maximum(sol(sol.t; idxs = sys.G))
 end
 
-massed_peak = begin
-	sol, events = solve_massed(massed, tspan, 1, 0.0, ev_duration)
-	maximum(sol(sol.t; idxs = massed.G))
+massed_peak = let
+	sys = massed_system()
+	sol, _ = solve_massed(sys, tspan, 1, 0.0, duration)
+	maximum(sol(sol.t; idxs = sys.G))
 end
 
-massed_parameters = begin
-	sym_params = Symbol.("parameters/".*string.(parameters(massed)))
-	p = ODEProblem(massed, [], tspan).p
+massed_parameters = let
+	sys = massed_system()
+	sym_params = Symbol.("parameters/".*string.(parameters(sys)))
+	p = ODEProblem(sys, [], tspan).p
 	collect(zip(sym_params, p[1]))
 end
 
 jldsave("massed_heatmap.jld2";
-	ev_repeats,
-	ev_delays,
-	peaks = massed_spaced_peaks,
+	delays,
+	duration,
+	equations = string.(equations(massed_system())),
+	fc = log2.(massed_spaced_peaks ./ massed_peak),
 	massed_peak,
+	peaks = massed_spaced_peaks,
+	repeats,
 	tspan,
-	ev_duration,
-	equations = string.(equations(massed)),
 	massed_parameters...,
 )
